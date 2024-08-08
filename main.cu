@@ -100,8 +100,8 @@ public:
 			angle += rotateAmount;
 		}
 	}
-	void draw() {
-		SDL_RenderDrawPoint(renderer, static_cast<int>(x), static_cast<int>(y));
+	void draw(Uint32* pixel_ptr) {
+		pixel_ptr[static_cast<int>(y) * WIDTH + static_cast<int>(x)] = 0xffffffff;
 	}
 	__device__ void trail(double* pheremones) {
 		pheremones[static_cast<int>(y) * WIDTH + static_cast<int>(x)] = 1.0;
@@ -111,8 +111,8 @@ double speed = 1.0;
 double sensorDistance = 10.0;
 double sensorAngle = M_PI / 4;
 double rotateAmount = M_PI / 16;
-const int CELLCOUNT = 10000; //KEEP SQUARE AND LESS THAN 1024^2
-const int CELLCOUNTSQRT = 100; //KEEP AS SQRT OF CELLCOUNT
+const int CELLCOUNTSQRT = 100; //KEEP LESS THAN 1024
+const int CELLCOUNT = CELLCOUNTSQRT * CELLCOUNTSQRT;
 Cell cells[CELLCOUNT];
 Cell* d_cells;
 size_t s_cells = sizeof(Cell) * static_cast<size_t>(CELLCOUNT);
@@ -142,7 +142,7 @@ __device__ Uint32 red = 0x01000000, blue = 0x00010000, green = 0x00000100;
 __global__ void pixelize(double* pheremones, Uint32* pixel_ptr, double TRAILDECAY) {
 	double* p = &pheremones[threadIdx.x * WIDTH + blockIdx.x];
 	if (*p > 0.0) {
-		*p = *p - TRAILDECAY;
+		*p -= TRAILDECAY;
 		if (*p < 0.0) {
 			*p = 0.0;
 		}
@@ -250,11 +250,13 @@ int main(int argc, char* argv[]) {
 			cudaMemcpy(d_newP, newP, s_pheremones, cudaMemcpyHostToDevice);
 			cudaMemcpy(d_cells, cells, s_cells, cudaMemcpyHostToDevice);
 			diffuseTrail << <WIDTH, HEIGHT >> > (d_pheremones, d_newP, DIFFUSION);
+			cudaDeviceSynchronize();
 			copyTrail << <WIDTH, HEIGHT >> > (d_pheremones, d_newP);
+			cudaDeviceSynchronize();
 			moveCell << <CELLCOUNTSQRT, CELLCOUNTSQRT >> > (d_cells, d_state, speed, d_pheremones);
+			cudaDeviceSynchronize();
 			sense << <CELLCOUNTSQRT, CELLCOUNTSQRT >> > (d_cells, d_state, sensorDistance, sensorAngle, rotateAmount, d_pheremones);
 			cudaDeviceSynchronize();
-			cudaMemcpy(pheremones, d_pheremones, s_pheremones, cudaMemcpyDeviceToHost);
 			cudaMemcpy(newP, d_newP, s_pheremones, cudaMemcpyDeviceToHost);
 			cudaMemcpy(cells, d_cells, s_cells, cudaMemcpyDeviceToHost);
 			if (timing) {
@@ -271,13 +273,20 @@ int main(int argc, char* argv[]) {
 			pixelize << <WIDTH, HEIGHT >> > (d_pheremones, d_pixel_ptr, TRAILDECAY);
 			cudaDeviceSynchronize();
 			cudaMemcpy(pixel_ptr, d_pixel_ptr, s_pixel_ptr, cudaMemcpyDeviceToHost);
+			cudaMemcpy(pheremones, d_pheremones, s_pheremones, cudaMemcpyDeviceToHost);
 
 			SDL_UnlockTexture(texture);
-			//SDL_RenderCopy(renderer, texture, NULL, NULL);
-			SDL_SetRenderDrawColor(renderer, 255, 255, 255, 255);
-			for (int i = 0; i < CELLCOUNT; i++) {
-				cells[i].draw();
+
+			SDL_LockTexture(textureA, NULL, &txtPixels, &pitch);
+			pixel_ptrA = (Uint32*)txtPixels;
+			for (int i = 0; i < WIDTH * HEIGHT; i++) {
+				pixel_ptrA[i] = pixel_ptr[i];
 			}
+			for (int i = 0; i < CELLCOUNT; i++) {
+				cells[i].draw(pixel_ptrA);
+			}
+			SDL_UnlockTexture(textureA);
+			SDL_RenderCopy(renderer, textureA, NULL, NULL);
 			SDL_RenderPresent(renderer);
 			if (timing) {
 				std::cout << " draw time: " << SDL_GetTicks() - drawStart;
@@ -293,6 +302,8 @@ int main(int argc, char* argv[]) {
 		SDL_DestroyTexture(texture);
 		cudaFree(d_pheremones);
 		cudaFree(d_newP);
+		cudaFree(d_cells);
+		cudaFree(d_pixel_ptr);
 		if (window) {
 			SDL_DestroyWindow(window);
 		}
