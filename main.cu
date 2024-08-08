@@ -68,6 +68,10 @@ __global__ void copyTrail(double* pheremones, double* newP) {
 	//pheremones[threadIdx.x * WIDTH + blockIdx.x] = 1.0;
 }
 
+double speed = 1.0;
+double sensorDistance = 10.0;
+double sensorAngle = M_PI / 4;
+double rotateAmount = M_PI / 16;
 class Cell {
 public:
 	double x = 0.0, y = 0.0, angle = 0.0;
@@ -83,7 +87,7 @@ public:
 			return false;
 		}
 	}
-	__device__ void sense(curandState* state, double sensorDistance, double sensorAngle, double rotateAmount, double* pheremones) {
+	__device__ void sense(double sensorDistance, double sensorAngle, double rotateAmount, double* pheremones, curandState* state) {
 		double frontSensor = pheremones[static_cast<int>(y + sensorDistance * sin(angle) + 0.5) * WIDTH + static_cast<int>(x + sensorDistance * cos(angle) + 0.5)];
 		double leftSensor = pheremones[static_cast<int>(y + sensorDistance * sin(angle + sensorAngle) + 0.5) * WIDTH + static_cast<int>(x + sensorDistance * cos(angle + sensorAngle) + 0.5)];
 		double rightSensor = pheremones[static_cast<int>(y + sensorDistance * sin(angle - sensorAngle) + 0.5) * WIDTH + static_cast<int>(x + sensorDistance * cos(angle - sensorAngle) + 0.5)];
@@ -91,7 +95,8 @@ public:
 			return;
 		}
 		else if (frontSensor < leftSensor && frontSensor < rightSensor) {
-			angle += static_cast<float>(2 * curand(state) % 2 - 1) * rotateAmount;
+			angle += static_cast<float>((2 * (curand(state) % 2)) - 1) * rotateAmount;
+			//angle += rotateAmount;
 		}
 		else if (rightSensor > leftSensor) {
 			angle -= rotateAmount;
@@ -107,18 +112,13 @@ public:
 		pheremones[static_cast<int>(y) * WIDTH + static_cast<int>(x)] = 1.0;
 	}
 };
-double speed = 1.0;
-double sensorDistance = 10.0;
-double sensorAngle = M_PI / 4;
-double rotateAmount = M_PI / 16;
-const int CELLCOUNTSQRT = 100; //KEEP LESS THAN 1024
+const int CELLCOUNTSQRT = 500; //Keep at less than 1024
 const int CELLCOUNT = CELLCOUNTSQRT * CELLCOUNTSQRT;
 Cell cells[CELLCOUNT];
 Cell* d_cells;
 size_t s_cells = sizeof(Cell) * static_cast<size_t>(CELLCOUNT);
-
-__global__ void moveCell(Cell* cells, curandState* state, double speed, double* pheremones) {
-	int i = CELLCOUNTSQRT * threadIdx.x + blockIdx.x;
+__global__ void moveCell(Cell* cells, double* pheremones, double speed, curandState* state) {
+	int i = blockIdx.x * CELLCOUNTSQRT + threadIdx.x;
 	if (cells[i].move(speed)) {
 		cells[i].trail(pheremones);
 	}
@@ -126,8 +126,8 @@ __global__ void moveCell(Cell* cells, curandState* state, double speed, double* 
 		cells[i].angle = curand_uniform(state) * 2.0 * M_PI;
 	}
 }
-__global__ void sense(Cell* cells, curandState* state, double sensorDistance, double sensorAngle, double rotateAmount, double* pheremones) {
-	cells[CELLCOUNTSQRT * threadIdx.x + blockIdx.x].sense(state, sensorDistance, sensorAngle, rotateAmount, pheremones);
+__global__ void fullSense(Cell* cells, double sensorDistance, double sensorAngle, double rotateAmount, double* pheremones, curandState* state) {
+	cells[blockIdx.x * CELLCOUNTSQRT + threadIdx.x].sense(sensorDistance, sensorAngle, rotateAmount, pheremones, state);
 }
 
 void debug(int line, std::string file) {
@@ -138,23 +138,10 @@ double random() {
 	return static_cast<float>(rand()) / static_cast<float>(RAND_MAX);
 }
 
-__device__ Uint32 red = 0x01000000, blue = 0x00010000, green = 0x00000100;
-__global__ void pixelize(double* pheremones, Uint32* pixel_ptr, double TRAILDECAY) {
-	double* p = &pheremones[threadIdx.x * WIDTH + blockIdx.x];
-	if (*p > 0.0) {
-		*p -= TRAILDECAY;
-		if (*p < 0.0) {
-			*p = 0.0;
-		}
-	}
-	pixel_ptr[threadIdx.x * WIDTH + blockIdx.x] = static_cast<Uint32>(*p * 255) * (red + green + blue) + 255;
-}
-Uint32* pixel_ptr, *d_pixel_ptr, *pixel_ptrA;
-size_t s_pixel_ptr = sizeof(Uint32) * static_cast<size_t>(WIDTH * HEIGHT);
-
 Uint32 frameStart, calcStart, drawStart;
 int frameTime = 0;
 bool timing = true;
+Uint32 red = 0x01000000, blue = 0x00010000, green = 0x00000100;
 int main(int argc, char* argv[]) {
 	srand(time(0));
 	if (SDL_Init(SDL_INIT_EVERYTHING) == 0 && TTF_Init() == 0 && Mix_OpenAudio(44100, MIX_DEFAULT_FORMAT, 2, 2048) == 0) {
@@ -178,7 +165,6 @@ int main(int argc, char* argv[]) {
 		cudaMalloc((void**)&d_pheremones, s_pheremones);
 		cudaMalloc((void**)&d_newP, s_pheremones);
 		cudaMalloc((void**)&d_cells, s_cells);
-		cudaMalloc((void**)&d_pixel_ptr, s_pixel_ptr);
 
 		SDL_Texture* texture = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_RGBA8888,
 			SDL_TEXTUREACCESS_STREAMING, WIDTH, HEIGHT);
@@ -187,13 +173,14 @@ int main(int argc, char* argv[]) {
 		void* txtPixels;
 		int pitch;
 		SDL_PixelFormat* format = SDL_AllocFormat(SDL_PIXELFORMAT_RGBA8888);
+		Uint32* pixel_ptr, * pixel_ptrA;
 
 		double angle;
 		double radius;
 		for (int i = 0; i < CELLCOUNT; i++) {
 			angle = random() * 2.0 * M_PI;
 			radius = std::min(HEIGHT, WIDTH) * random() / 2;
-			cells[i].angle = angle;
+			cells[i].angle =  angle;
 			cells[i].x = static_cast<float>(WIDTH) / 2.0 - radius * cos(angle);
 			cells[i].y = static_cast<float>(HEIGHT) / 2.0 - radius * sin(angle);
 		}
@@ -250,15 +237,16 @@ int main(int argc, char* argv[]) {
 			cudaMemcpy(d_newP, newP, s_pheremones, cudaMemcpyHostToDevice);
 			cudaMemcpy(d_cells, cells, s_cells, cudaMemcpyHostToDevice);
 			diffuseTrail << <WIDTH, HEIGHT >> > (d_pheremones, d_newP, DIFFUSION);
-			cudaDeviceSynchronize();
 			copyTrail << <WIDTH, HEIGHT >> > (d_pheremones, d_newP);
+			moveCell << <CELLCOUNTSQRT, CELLCOUNTSQRT >> > (d_cells, d_pheremones, speed, d_state);
+			fullSense << <CELLCOUNTSQRT, CELLCOUNTSQRT >> > (d_cells, sensorDistance, sensorAngle, rotateAmount, d_pheremones, d_state);
 			cudaDeviceSynchronize();
-			moveCell << <CELLCOUNTSQRT, CELLCOUNTSQRT >> > (d_cells, d_state, speed, d_pheremones);
-			cudaDeviceSynchronize();
-			sense << <CELLCOUNTSQRT, CELLCOUNTSQRT >> > (d_cells, d_state, sensorDistance, sensorAngle, rotateAmount, d_pheremones);
-			cudaDeviceSynchronize();
+			cudaMemcpy(pheremones, d_pheremones, s_pheremones, cudaMemcpyDeviceToHost);
 			cudaMemcpy(newP, d_newP, s_pheremones, cudaMemcpyDeviceToHost);
 			cudaMemcpy(cells, d_cells, s_cells, cudaMemcpyDeviceToHost);
+			/*for (int i = 0; i < CELLCOUNT; i++) {
+				cells[i].sense(sensorDistance, sensorAngle, rotateAmount, pheremones, d_state);
+			}*/
 			if (timing) {
 				std::cout << "calc time: " << SDL_GetTicks() - calcStart;
 			}
@@ -267,15 +255,18 @@ int main(int argc, char* argv[]) {
 			SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
 			SDL_RenderClear(renderer);
 			SDL_LockTexture(texture, NULL, &txtPixels, &pitch);
-			pixel_ptr = (Uint32*)txtPixels;
-
-			cudaMemcpy(d_pixel_ptr, pixel_ptr, s_pixel_ptr, cudaMemcpyHostToDevice);
-			pixelize << <WIDTH, HEIGHT >> > (d_pheremones, d_pixel_ptr, TRAILDECAY);
-			cudaDeviceSynchronize();
-			cudaMemcpy(pixel_ptr, d_pixel_ptr, s_pixel_ptr, cudaMemcpyDeviceToHost);
-			cudaMemcpy(pheremones, d_pheremones, s_pheremones, cudaMemcpyDeviceToHost);
-
+			pixel_ptr = (Uint32*)txtPixels;		
+			double* p;
+			for (int i = 0; i < WIDTH * HEIGHT; i++) {
+				p = &pheremones[i];
+				if (*p > 0.0) {
+					*p = std::max(0.0, *p - TRAILDECAY);
+				}
+				pixel_ptr[i] = static_cast<Uint32>(*p * 255) * (red + green + blue) + 255;
+			}
 			SDL_UnlockTexture(texture);
+			
+
 
 			SDL_LockTexture(textureA, NULL, &txtPixels, &pitch);
 			pixel_ptrA = (Uint32*)txtPixels;
@@ -303,7 +294,7 @@ int main(int argc, char* argv[]) {
 		cudaFree(d_pheremones);
 		cudaFree(d_newP);
 		cudaFree(d_cells);
-		cudaFree(d_pixel_ptr);
+		cudaFree(d_state);
 		if (window) {
 			SDL_DestroyWindow(window);
 		}
