@@ -29,16 +29,21 @@ int mouseDeltaY = 0;
 int mouseScroll = 0;
 std::set<int> buttons;
 std::set<int> currentButtons;
-const int WIDTH = 800;
+const int WIDTH = 600;
 const int HEIGHT = 600;
+const int CONTROLWIDTH = 200;
 
 __global__ void initCurand(unsigned int seed, curandState* state) {
 	int idx = threadIdx.x + blockDim.x * blockIdx.x;
 	curand_init(seed, idx, 0, &state[idx]);
 }
 
-const double TRAILDECAY = 0.01;
-const double DIFFUSION = 20.0; //inverse
+double speed = 1.0;
+double TRAILDECAY = 0.01;
+double DIFFUSION = 20.0; //inverse
+double sensorDistance = 10.0;
+double sensorAngle = M_PI / 4;
+double rotateAmount = M_PI / 16;
 double pheremones[HEIGHT * WIDTH] = { 0.0 };
 double newP[HEIGHT * WIDTH];
 double *d_newP, *d_pheremones;
@@ -68,10 +73,6 @@ __global__ void copyTrail(double* pheremones, double* newP) {
 	//pheremones[threadIdx.x * WIDTH + blockIdx.x] = 1.0;
 }
 
-double speed = 1.0;
-double sensorDistance = 10.0;
-double sensorAngle = M_PI / 4;
-double rotateAmount = M_PI / 16;
 class Cell {
 public:
 	double x = 0.0, y = 0.0, angle = 0.0;
@@ -95,8 +96,8 @@ public:
 			return;
 		}
 		else if (frontSensor < leftSensor && frontSensor < rightSensor) {
-			angle += static_cast<float>((2 * (curand(state) % 2)) - 1) * rotateAmount;
-			//angle += rotateAmount;
+			//angle += static_cast<float>((2 * (curand(state) % 2)) - 1) * rotateAmount;
+			angle += rotateAmount;
 		}
 		else if (rightSensor > leftSensor) {
 			angle -= rotateAmount;
@@ -106,7 +107,7 @@ public:
 		}
 	}
 	void draw(Uint32* pixel_ptr) {
-		pixel_ptr[static_cast<int>(y) * WIDTH + static_cast<int>(x)] = 0xffffffff;
+		pixel_ptr[static_cast<int>(y) * WIDTH + static_cast<int>(x)] = 0x00ffffff;
 	}
 	__device__ void trail(double* pheremones) {
 		pheremones[static_cast<int>(y) * WIDTH + static_cast<int>(x)] = 1.0;
@@ -138,15 +139,135 @@ double random() {
 	return static_cast<float>(rand()) / static_cast<float>(RAND_MAX);
 }
 
+class Button {
+public:
+	uint8_t r = 0, g = 0, b = 0;
+	SDL_Rect rect = { 0, 0, 0, 0 };
+	bool hovered() {
+		return rect.x < mouseX && mouseX < rect.x + rect.w && rect.y < mouseY && mouseY < rect.y + rect.h;
+	}
+	void draw() {
+		SDL_SetRenderDrawColor(renderer, r, g, b, 255);
+		SDL_RenderFillRect(renderer, &rect);
+		SDL_SetRenderDrawColor(renderer, 255, 255, 255, 255);
+		SDL_RenderDrawRect(renderer, &rect);
+	}
+	void setRGB(double attraction) {
+		if (attraction > 0.0) {
+			g = 255 * attraction;
+			r = 0;
+		}
+		else {
+			r = 255 * -attraction;
+			g = 0;
+		}
+	}
+};
+
+TTF_Font* font;
+class Text {
+public:
+	SDL_Rect rect = { 0, 0, 0, 0 };
+	SDL_Texture* texture = NULL;
+	~Text() {
+		removeTexture();
+	}
+	void draw() {
+		if (SDL_RenderCopy(renderer, texture, NULL, &rect) != 0) {
+			debug(__LINE__, __FILE__);
+		}
+	}
+	void removeTexture() {
+		if (texture != NULL) {
+			SDL_DestroyTexture(texture);
+			texture = NULL;
+		}
+	}
+	void createTexture(std::string text, int height) {
+		SDL_Surface* tmp = TTF_RenderText_Solid(font, text.c_str(), { 255, 255, 255 });
+		if (tmp == NULL) {
+			debug(__LINE__, __FILE__);
+			return;
+		}
+		removeTexture();
+		texture = SDL_CreateTextureFromSurface(renderer, tmp);
+		rect.h = height;
+		rect.w = tmp->w * height / tmp->h;
+		SDL_FreeSurface(tmp);
+		if (texture == NULL) {
+			debug(__LINE__, __FILE__);
+		}
+
+	}
+};
+
+class Slider {
+public:
+	Text label;
+	Button bar, handle;
+	Slider() {
+		handle.r = 255;
+		handle.g = 255;
+		handle.b = 255;
+		handle.rect.w = 6;
+
+		bar.r = 255;
+		bar.g = 255;
+		bar.b = 255;
+		bar.rect.h = 6;
+	}
+	void setText(std::string text, int height) {
+		label.createTexture(text, height);
+		handle.rect.h = label.rect.h;
+	}
+	void setPos(int x, int y) {
+		label.rect.x = x;
+		label.rect.y = y;
+		handle.rect.x = label.rect.w + 10 + x - handle.rect.w / 2;
+		handle.rect.y = y;
+		bar.rect.x = x + label.rect.w + 10;
+		bar.rect.y = y - (bar.rect.h - handle.rect.h) / 2;
+	}
+	void setValue(double value) {
+		handle.rect.x = bar.rect.x - handle.rect.w / 2 + value * bar.rect.w;
+	}
+	void setEverything(std::string text, int height, int x, int y, double value) {
+		setText(text, height);
+		setPos(x, y);
+		bar.rect.w = CONTROLWIDTH + WIDTH - bar.rect.x - 5;
+		setValue(value);
+	}
+	double getValue() {
+		return static_cast<float>(handle.rect.x + handle.rect.w / 2 - bar.rect.x) / static_cast<float>(bar.rect.w);
+	}
+	double update() {
+		if ((bar.hovered() || handle.hovered()) && buttons.contains(1)) {
+			handle.rect.x = std::max(bar.rect.x, std::min(mouseX, bar.rect.x + bar.rect.w)) - handle.rect.w / 2;
+		}
+		bar.draw();
+		handle.draw();
+		label.draw();
+		return getValue();
+	}
+};
+Slider diffusionSlider, decaySlider, distanceSlider, offsetSlider, angleSlider;
+
 Uint32 frameStart, calcStart, drawStart;
 int frameTime = 0;
-bool timing = true;
-Uint32 red = 0x01000000, blue = 0x00010000, green = 0x00000100;
+bool timing = false;
+Uint32 red = 0x01000000, green = 0x00010000, blue = 0x00000100;
+SDL_Rect textureRect = { 0, 0, WIDTH, HEIGHT };
 int main(int argc, char* argv[]) {
+	int deviceCount;
+	cudaGetDeviceCount(&deviceCount);
+	if (deviceCount == 0) {
+		std::cerr << "Uh oh, looks like your graphics card sucks, dawg. Can't run this. Womp womp" << std::endl;
+		return 1;
+	}
 	srand(time(0));
 	if (SDL_Init(SDL_INIT_EVERYTHING) == 0 && TTF_Init() == 0 && Mix_OpenAudio(44100, MIX_DEFAULT_FORMAT, 2, 2048) == 0) {
 		//Setup
-		window = SDL_CreateWindow("Window", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, WIDTH, HEIGHT, 0);
+		window = SDL_CreateWindow("Window", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, WIDTH + CONTROLWIDTH, HEIGHT, 0);
 		if (window == NULL) {
 			debug(__LINE__, __FILE__);
 			return 0;
@@ -184,6 +305,16 @@ int main(int argc, char* argv[]) {
 			cells[i].x = static_cast<float>(WIDTH) / 2.0 - radius * cos(angle);
 			cells[i].y = static_cast<float>(HEIGHT) / 2.0 - radius * sin(angle);
 		}
+
+		font = TTF_OpenFont("font.otf", CONTROLWIDTH / 10);
+		
+		diffusionSlider.setEverything("diffusion", CONTROLWIDTH / 10, WIDTH + 5, 5, 0.25);
+		decaySlider.setEverything("decay", diffusionSlider.label.rect.h, diffusionSlider.label.rect.x, diffusionSlider.label.rect.y + diffusionSlider.label.rect.h, 0.2);
+		distanceSlider.setEverything("distance", diffusionSlider.label.rect.h, diffusionSlider.label.rect.x, decaySlider.label.rect.y + decaySlider.label.rect.h, 10.0 / 20.0);
+		offsetSlider.setEverything("offset", diffusionSlider.label.rect.h, diffusionSlider.label.rect.x, distanceSlider.label.rect.y + distanceSlider.label.rect.h, 0.5);
+		angleSlider.setEverything("rotate", diffusionSlider.label.rect.h, diffusionSlider.label.rect.x, offsetSlider.label.rect.y + offsetSlider.label.rect.h, 0.1);
+
+
 
 		//Main loop
 		running = true;
@@ -262,7 +393,7 @@ int main(int argc, char* argv[]) {
 				if (*p > 0.0) {
 					*p = std::max(0.0, *p - TRAILDECAY);
 				}
-				pixel_ptr[i] = static_cast<Uint32>(*p * 255) * (red + green + blue) + 255;
+				pixel_ptr[i] = static_cast<Uint32>(*p * 255.0) * green + 255 * blue + 255;
 			}
 			SDL_UnlockTexture(texture);
 			
@@ -277,7 +408,12 @@ int main(int argc, char* argv[]) {
 				cells[i].draw(pixel_ptrA);
 			}
 			SDL_UnlockTexture(textureA);
-			SDL_RenderCopy(renderer, textureA, NULL, NULL);
+			SDL_RenderCopy(renderer, textureA, NULL, &textureRect);
+			DIFFUSION = 1.0 + 99.0 * diffusionSlider.update();
+			TRAILDECAY = 0.05 * decaySlider.update();
+			sensorDistance = 2.0 + 48.0 * distanceSlider.update();
+			sensorAngle = offsetSlider.update() * M_PI / 2;
+			rotateAmount = angleSlider.update() * M_PI / 4;
 			SDL_RenderPresent(renderer);
 			if (timing) {
 				std::cout << " draw time: " << SDL_GetTicks() - drawStart;
@@ -291,6 +427,7 @@ int main(int argc, char* argv[]) {
 		//Clean up
 		SDL_FreeFormat(format);
 		SDL_DestroyTexture(texture);
+		TTF_CloseFont(font);
 		cudaFree(d_pheremones);
 		cudaFree(d_newP);
 		cudaFree(d_cells);
