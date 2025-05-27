@@ -1,0 +1,1 @@
+A simulation of slime mold behavior using pheremones, implemented in C++ with SDL2 for the GUI and real-time visualizations and CUDA for using GPU-accelerated computing. The cells release pheremones that affect the movement of other cells, which all together create a complex and beautiful visualization.
